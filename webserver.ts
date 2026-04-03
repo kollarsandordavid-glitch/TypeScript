@@ -2,6 +2,7 @@ import * as http from 'http'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as url from 'url'
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { WebSocketServer, WebSocket } from 'ws'
 
 const PORT = 5000
@@ -18,11 +19,10 @@ const MIME: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
-  '.woff': 'font/woff',
-  '.ttf': 'font/ttf',
   '.webmanifest': 'application/manifest+json',
 }
 
+// ─── HTTP server (serves built frontend) ────────────────────────────────────
 const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url ?? '/')
   let filePath = path.join(PUBLIC, parsed.pathname === '/' ? 'index.html' : parsed.pathname ?? '')
@@ -30,7 +30,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Cache-Control', 'no-cache')
 
-  if (!fs.existsSync(filePath)) {
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
     filePath = path.join(PUBLIC, 'index.html')
   }
 
@@ -47,121 +47,219 @@ const server = http.createServer((req, res) => {
   }
 })
 
+// ─── WebSocket server ────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server, path: '/ws' })
 
-interface ClientState {
-  conversations: Map<string, Array<{ role: string; content: string }>>
+interface Session {
+  proc: ChildProcessWithoutNullStreams
+  convId: string
+  ws: WebSocket
+  buf: string
 }
 
-const clients = new Map<WebSocket, ClientState>()
+const sessions = new Map<string, Session>()
 
 wss.on('connection', (ws) => {
-  const state: ClientState = { conversations: new Map() }
-  clients.set(ws, state)
+  console.log('[ws] Client connected')
 
   ws.on('message', async (raw) => {
-    let data: { type: string; content?: string; conversationId?: string }
-    try {
-      data = JSON.parse(raw.toString())
-    } catch {
-      return
-    }
+    let data: { type: string; content?: string; conversationId?: string; cwd?: string }
+    try { data = JSON.parse(raw.toString()) } catch { return }
 
     if (data.type === 'message' && data.content) {
-      const convId = data.conversationId ?? 'default'
-      const history = state.conversations.get(convId) ?? []
-      history.push({ role: 'user', content: data.content })
-      state.conversations.set(convId, history)
+      const convId = data.conversationId ?? crypto.randomUUID()
+      const existing = sessions.get(convId)
 
+      if (existing && existing.proc.exitCode === null) {
+        // Send follow-up message to existing process stdin
+        sendToProcess(existing, data.content)
+      } else {
+        // Spawn a new Claude Code process for this conversation
+        spawnClaudeProcess(ws, convId, data.content, data.cwd)
+      }
+    }
+
+    if (data.type === 'interrupt') {
+      const sess = sessions.get(data.conversationId ?? '')
+      if (sess) sess.proc.kill('SIGINT')
+    }
+  })
+
+  ws.on('close', () => {
+    console.log('[ws] Client disconnected')
+    // Clean up processes belonging to this client
+    for (const [convId, sess] of sessions.entries()) {
+      if (sess.ws === ws && sess.proc.exitCode === null) {
+        sess.proc.kill()
+        sessions.delete(convId)
+      }
+    }
+  })
+})
+
+function sendToProcess(sess: Session, message: string) {
+  // stream-json input: write JSON-encoded user message
+  const msg = JSON.stringify({ type: 'user', message: { role: 'user', content: message } }) + '\n'
+  sess.proc.stdin.write(msg)
+  console.log(`[proc:${sess.convId}] → stdin: ${message.slice(0, 80)}`)
+}
+
+function spawnClaudeProcess(ws: WebSocket, convId: string, initialPrompt: string, cwd?: string) {
+  const workDir = cwd ?? process.cwd()
+
+  const args = [
+    'main.tsx',
+    '--print',
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--input-format', 'stream-json',
+    '--dangerously-skip-permissions',
+    '--include-partial-messages',
+    initialPrompt,
+  ]
+
+  console.log(`[proc:${convId}] Spawning: bun ${args.join(' ').slice(0, 120)}`)
+
+  const proc = spawn('bun', args, {
+    cwd: workDir,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      TERM: 'dumb',
+      NO_COLOR: '1',
+      FORCE_COLOR: '0',
+    },
+  })
+
+  const sess: Session = { proc, convId, ws, buf: '' }
+  sessions.set(convId, sess)
+
+  send(ws, { type: 'session_start', conversationId: convId })
+
+  // ─── stdout: JSON-line stream ───────────────────────────────────────────
+  proc.stdout.on('data', (chunk: Buffer) => {
+    sess.buf += chunk.toString()
+    const lines = sess.buf.split('\n')
+    sess.buf = lines.pop() ?? ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
       try {
-        await streamResponse(ws, data.content, convId, history)
-      } catch (err) {
-        send(ws, { type: 'error', content: String(err), conversationId: convId })
+        const msg = JSON.parse(trimmed)
+        handleClaudeMessage(ws, convId, msg)
+      } catch {
+        // plain text fallback
+        if (trimmed) send(ws, { type: 'text', content: trimmed, conversationId: convId })
       }
     }
   })
 
-  ws.on('close', () => clients.delete(ws))
-})
-
-async function streamResponse(
-  ws: WebSocket,
-  userMsg: string,
-  convId: string,
-  history: Array<{ role: string; content: string }>
-) {
-  const apiKey = process.env.ANTHROPIC_API_KEY
-
-  if (!apiKey) {
-    const reply = demoReply(userMsg)
-    for (const chunk of reply) {
-      if (ws.readyState !== WebSocket.OPEN) return
-      send(ws, { type: 'delta', content: chunk, conversationId: convId })
-      await sleep(30)
+  // ─── stderr: forward as system messages ────────────────────────────────
+  proc.stderr.on('data', (chunk: Buffer) => {
+    const text = chunk.toString().trim()
+    if (text) {
+      console.error(`[proc:${convId}] stderr:`, text.slice(0, 200))
+      send(ws, { type: 'stderr', content: text, conversationId: convId })
     }
-    send(ws, { type: 'done', conversationId: convId })
-    history.push({ role: 'assistant', content: reply.join('') })
-    return
-  }
-
-  const messages = history.slice(-20).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
-
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-opus-4-5',
-      max_tokens: 4096,
-      stream: true,
-      system: 'You are Claude Code, an expert AI coding assistant. Help the user with their coding tasks clearly and concisely.',
-      messages,
-    }),
   })
 
-  if (!resp.ok || !resp.body) {
-    throw new Error(`API error: ${resp.status} ${await resp.text()}`)
-  }
+  proc.on('exit', (code) => {
+    console.log(`[proc:${convId}] Exited with code ${code}`)
+    sessions.delete(convId)
+    send(ws, { type: 'done', conversationId: convId, exitCode: code })
+  })
 
-  const reader = resp.body.getReader()
-  const dec = new TextDecoder()
-  let fullText = ''
-  let buf = ''
+  proc.on('error', (err) => {
+    console.error(`[proc:${convId}] Error:`, err.message)
+    send(ws, { type: 'error', content: err.message, conversationId: convId })
+  })
+}
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += dec.decode(value, { stream: true })
-    const lines = buf.split('\n')
-    buf = lines.pop() ?? ''
+// ─── Parse and relay Claude stream-json messages ────────────────────────────
+function handleClaudeMessage(ws: WebSocket, convId: string, msg: Record<string, unknown>) {
+  const type = msg.type as string
 
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue
-      const payload = line.slice(6).trim()
-      if (payload === '[DONE]') continue
-      try {
-        const ev = JSON.parse(payload)
-        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
-          const chunk = ev.delta.text as string
-          fullText += chunk
-          if (ws.readyState === WebSocket.OPEN) {
-            send(ws, { type: 'delta', content: chunk, conversationId: convId })
-          }
+  // Assistant text streaming
+  if (type === 'assistant') {
+    const message = msg.message as Record<string, unknown> | undefined
+    if (message?.content && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        const b = block as Record<string, unknown>
+        if (b.type === 'text') {
+          send(ws, { type: 'assistant_text', content: b.text, conversationId: convId })
+        } else if (b.type === 'tool_use') {
+          send(ws, {
+            type: 'tool_call',
+            toolId: b.id,
+            toolName: b.name,
+            input: b.input,
+            conversationId: convId,
+          })
+        } else if (b.type === 'thinking') {
+          send(ws, { type: 'thinking', content: b.thinking, conversationId: convId })
         }
-      } catch {}
+      }
     }
   }
 
-  send(ws, { type: 'done', conversationId: convId })
-  history.push({ role: 'assistant', content: fullText })
-}
+  // Tool result
+  else if (type === 'tool_result' || type === 'user') {
+    const message = msg.message as Record<string, unknown> | undefined
+    if (message?.content && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        const b = block as Record<string, unknown>
+        if (b.type === 'tool_result') {
+          send(ws, {
+            type: 'tool_result',
+            toolId: b.tool_use_id,
+            content: Array.isArray(b.content)
+              ? (b.content as Array<Record<string, unknown>>).map(c => c.text ?? '').join('\n')
+              : String(b.content ?? ''),
+            isError: b.is_error,
+            conversationId: convId,
+          })
+        }
+      }
+    }
+  }
 
-function demoReply(msg: string): string[] {
-  const text = `I received your message: "${msg}"\n\nThis is a demo response since no **ANTHROPIC_API_KEY** is set. Add your API key to get real Claude responses!\n\nTo set it up:\n1. Get your API key from console.anthropic.com\n2. Set ANTHROPIC_API_KEY in your environment\n3. Restart the server`
-  return text.match(/.{1,8}/g) ?? [text]
+  // Partial streaming events
+  else if (type === 'stream_event') {
+    const event = msg.event as Record<string, unknown> | undefined
+    if (event?.type === 'content_block_delta') {
+      const delta = event.delta as Record<string, unknown> | undefined
+      if (delta?.type === 'text_delta') {
+        send(ws, { type: 'delta', content: delta.text, conversationId: convId })
+      }
+    }
+  }
+
+  // System info
+  else if (type === 'system') {
+    send(ws, { type: 'system', content: msg.subtype ?? msg.message, conversationId: convId })
+  }
+
+  // Final result
+  else if (type === 'result') {
+    send(ws, {
+      type: 'result',
+      result: msg.result,
+      is_error: msg.is_error,
+      costUsd: msg.total_cost_usd,
+      conversationId: convId,
+    })
+  }
+
+  // Permission request
+  else if (type === 'permission_request' || type === 'requires_action') {
+    send(ws, { type: 'permission', data: msg, conversationId: convId })
+  }
+
+  // Pass everything else through too
+  else {
+    send(ws, { type: 'raw', data: msg, conversationId: convId })
+  }
 }
 
 function send(ws: WebSocket, data: object) {
@@ -170,10 +268,7 @@ function send(ws: WebSocket, data: object) {
   }
 }
 
-function sleep(ms: number) {
-  return new Promise(r => setTimeout(r, ms))
-}
-
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Claude Code Web running at http://0.0.0.0:${PORT}`)
+  console.log(`🚀 Claude Code Web at http://0.0.0.0:${PORT}`)
+  console.log(`   Bun: ${process.env.BUN_VERSION ?? 'via PATH'}`)
 })
