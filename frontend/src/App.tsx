@@ -4,54 +4,36 @@ import { ChatWindow } from './components/ChatWindow'
 import { useWebSocket } from './hooks/useWebSocket'
 
 export default function App() {
-  const { status, conversations, activeId, setActiveId, getActive, newConversation, sendMessage } = useWebSocket()
-  const [sidebarOpen, setSidebarOpen] = useState(true)
-
-  const active = getActive()
+  const { status, serverInfo, conversations, activeId, setActiveId, getActive, newConversation, sendMessage, interrupt } = useWebSocket()
+  const [sidebar, setSidebar] = useState(true)
 
   return (
-    <div style={{
-      display: 'flex',
-      height: '100%',
-      width: '100%',
-      overflow: 'hidden',
-      background: 'var(--bg)',
-    }}>
+    <div style={{ display: 'flex', height: '100%', width: '100%', overflow: 'hidden', background: 'var(--bg)' }}>
       <style>{`
-        @keyframes blink {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0; }
-        }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.4; }
-        }
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(6px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        .menu-btn:hover { background: var(--bg3) !important; }
-        @media (max-width: 600px) {
-          aside { position: fixed; left: 0; top: 0; bottom: 0; z-index: 50; transform: translateX(${sidebarOpen ? '0' : '-100%'}); }
-        }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
       `}</style>
 
-      {sidebarOpen && (
+      {sidebar && (
         <Sidebar
           conversations={conversations}
           activeId={activeId}
-          onSelect={(id) => { setActiveId(id); if (window.innerWidth < 600) setSidebarOpen(false) }}
-          onNew={() => { newConversation(); if (window.innerWidth < 600) setSidebarOpen(false) }}
-          open={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
+          onSelect={setActiveId}
+          onNew={newConversation}
+          open={sidebar}
+          onClose={() => setSidebar(false)}
+          serverInfo={serverInfo}
         />
       )}
 
       <ChatWindow
-        conversation={active}
+        conversation={getActive()}
         onSend={sendMessage}
+        onInterrupt={interrupt}
         status={status}
-        onMenuOpen={() => setSidebarOpen(v => !v)}
+        serverInfo={serverInfo}
+        onMenuToggle={() => setSidebar(v => !v)}
       />
     </div>
   )

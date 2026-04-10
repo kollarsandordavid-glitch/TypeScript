@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 
-export type MsgRole = 'user' | 'assistant' | 'tool_call' | 'tool_result' | 'thinking' | 'system' | 'error' | 'result'
+export type MsgRole = 'user' | 'assistant' | 'tool_call' | 'tool_result' | 'thinking' | 'system' | 'error' | 'result' | 'stderr'
 
 export interface ChatMessage {
   id: string
@@ -20,204 +20,220 @@ export interface Conversation {
   title: string
   messages: ChatMessage[]
   createdAt: number
-  thinking?: boolean
+  loading: boolean
 }
 
-type WSStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
+type WSStatus = 'connecting' | 'connected' | 'disconnected'
+
+interface ServerInfo {
+  model?: string
+  hasApiKey?: boolean
+}
 
 export function useWebSocket() {
-  const ws = useRef<WebSocket | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
   const [status, setStatus] = useState<WSStatus>('disconnected')
+  const [serverInfo, setServerInfo] = useState<ServerInfo>({})
+
+  const convsRef = useRef<Conversation[]>([])
   const [conversations, setConversations] = useState<Conversation[]>([])
-  const [activeId, setActiveId] = useState<string | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const pendingConvId = useRef<string | null>(null)
+  const activeRef = useRef<string | null>(null)
+  const [activeId, setActiveIdState] = useState<string | null>(null)
+
+  const updateConvs = useCallback((fn: (prev: Conversation[]) => Conversation[]) => {
+    convsRef.current = fn(convsRef.current)
+    setConversations([...convsRef.current])
+  }, [])
+
+  const setActiveId = useCallback((id: string | null) => {
+    activeRef.current = id
+    setActiveIdState(id)
+  }, [])
 
   const getActive = useCallback((): Conversation | null => {
-    return conversations.find(c => c.id === activeId) ?? null
-  }, [conversations, activeId])
+    return convsRef.current.find(c => c.id === activeRef.current) ?? null
+  }, [])
+
+  const uid = () => crypto.randomUUID()
 
   const newConversation = useCallback(() => {
-    const id = crypto.randomUUID()
-    const conv: Conversation = { id, title: 'New conversation', messages: [], createdAt: Date.now() }
-    setConversations(prev => [conv, ...prev])
+    const id = uid()
+    const conv: Conversation = { id, title: 'New chat', messages: [], createdAt: Date.now(), loading: false }
+    updateConvs(prev => [conv, ...prev])
     setActiveId(id)
     return id
-  }, [])
+  }, [updateConvs, setActiveId])
 
   const appendMsg = useCallback((convId: string, msg: ChatMessage) => {
-    setConversations(prev => prev.map(c => c.id === convId ? {
-      ...c,
-      messages: [...c.messages, msg],
-      title: c.messages.length === 0 && msg.role === 'user' ? msg.content.slice(0, 50) : c.title,
-    } : c))
-  }, [])
+    updateConvs(prev => prev.map(c => {
+      if (c.id !== convId) return c
+      const title = c.messages.length === 0 && msg.role === 'user' ? msg.content.slice(0, 50) : c.title
+      return { ...c, messages: [...c.messages, msg], title }
+    }))
+  }, [updateConvs])
 
-  const patchStream = useCallback((convId: string, delta: string, done: boolean) => {
-    setConversations(prev => prev.map(c => {
+  const setLoading = useCallback((convId: string, loading: boolean) => {
+    updateConvs(prev => prev.map(c => c.id === convId ? { ...c, loading } : c))
+  }, [updateConvs])
+
+  const patchDelta = useCallback((convId: string, delta: string) => {
+    updateConvs(prev => prev.map(c => {
       if (c.id !== convId) return c
       const msgs = [...c.messages]
       const last = msgs[msgs.length - 1]
       if (last?.role === 'assistant' && last.streaming) {
-        msgs[msgs.length - 1] = { ...last, content: last.content + delta, streaming: !done }
+        msgs[msgs.length - 1] = { ...last, content: last.content + delta }
       } else {
-        msgs.push({ id: crypto.randomUUID(), role: 'assistant', content: delta, timestamp: Date.now(), streaming: !done })
+        msgs.push({ id: uid(), role: 'assistant', content: delta, timestamp: Date.now(), streaming: true })
       }
-      return { ...c, messages: msgs }
+      return { ...c, messages: msgs, loading: true }
     }))
-  }, [])
+  }, [updateConvs])
 
   const patchThinking = useCallback((convId: string, delta: string) => {
-    setConversations(prev => prev.map(c => {
+    updateConvs(prev => prev.map(c => {
       if (c.id !== convId) return c
       const msgs = [...c.messages]
       const last = msgs[msgs.length - 1]
       if (last?.role === 'thinking' && last.streaming) {
-        msgs[msgs.length - 1] = { ...last, content: last.content + delta, streaming: true }
+        msgs[msgs.length - 1] = { ...last, content: last.content + delta }
       } else {
-        msgs.push({ id: crypto.randomUUID(), role: 'thinking', content: delta, timestamp: Date.now(), streaming: true })
+        msgs.push({ id: uid(), role: 'thinking', content: delta, timestamp: Date.now(), streaming: true })
       }
-      return { ...c, messages: msgs }
+      return { ...c, messages: msgs, loading: true }
     }))
-  }, [])
+  }, [updateConvs])
 
-  const stopStreaming = useCallback((convId: string) => {
-    setConversations(prev => prev.map(c => {
+  const stopAllStreaming = useCallback((convId: string) => {
+    updateConvs(prev => prev.map(c => {
       if (c.id !== convId) return c
-      return { ...c, thinking: false, messages: c.messages.map(m => ({ ...m, streaming: false })) }
+      return { ...c, loading: false, messages: c.messages.map(m => ({ ...m, streaming: false })) }
     }))
-  }, [])
+  }, [updateConvs])
 
-  const mapConvId = useCallback((serverConvId: string, localConvId: string | null) => {
-    if (!localConvId || serverConvId === localConvId) return
-    // Remap server-assigned conv ID to our local one
-    setConversations(prev => prev.map(c => c.id === localConvId ? { ...c, id: serverConvId } : c))
-    if (activeId === localConvId) setActiveId(serverConvId)
-  }, [activeId])
+  const handleMessage = useCallback((e: MessageEvent) => {
+    let data: Record<string, unknown>
+    try { data = JSON.parse(e.data) } catch { return }
+    const convId = data.conversationId as string | undefined
 
-  const connect = useCallback(() => {
-    if (ws.current?.readyState === WebSocket.OPEN) return
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const socket = new WebSocket(`${proto}://${location.host}/ws`)
-    ws.current = socket
-    setStatus('connecting')
-
-    socket.onopen = () => setStatus('connected')
-    socket.onclose = () => {
-      setStatus('disconnected')
-      reconnectTimer.current = setTimeout(connect, 3000)
-    }
-    socket.onerror = () => setStatus('error')
-
-    socket.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data) as Record<string, unknown>
-        const convId = data.conversationId as string | undefined
-        if (!convId) return
-
-        switch (data.type) {
-          case 'session_start':
-            // Server assigned a conv ID — map it to our local one
-            if (pendingConvId.current && pendingConvId.current !== convId) {
-              mapConvId(convId, pendingConvId.current)
-              pendingConvId.current = null
-            }
-            break
-
-          case 'delta':
-            patchStream(convId, data.content as string, false)
-            break
-
-          case 'assistant_text':
-            appendMsg(convId, {
-              id: crypto.randomUUID(), role: 'assistant',
-              content: data.content as string, timestamp: Date.now(),
-            })
-            break
-
-          case 'thinking':
-            patchThinking(convId, data.content as string)
-            break
-
-          case 'tool_call':
-            appendMsg(convId, {
-              id: crypto.randomUUID(), role: 'tool_call',
-              toolName: data.toolName as string,
-              toolId: data.toolId as string,
-              toolInput: data.input,
-              content: JSON.stringify(data.input, null, 2),
-              timestamp: Date.now(),
-            })
-            break
-
-          case 'tool_result':
-            appendMsg(convId, {
-              id: crypto.randomUUID(), role: 'tool_result',
-              toolId: data.toolId as string,
-              content: data.content as string,
-              isError: data.isError as boolean,
-              timestamp: Date.now(),
-            })
-            break
-
-          case 'system':
-            appendMsg(convId, {
-              id: crypto.randomUUID(), role: 'system',
-              content: String(data.content ?? ''), timestamp: Date.now(),
-            })
-            break
-
-          case 'result':
-            stopStreaming(convId)
-            if (data.costUsd) {
-              appendMsg(convId, {
-                id: crypto.randomUUID(), role: 'result',
-                content: `Cost: $${(data.costUsd as number).toFixed(4)}`,
-                costUsd: data.costUsd as number,
-                timestamp: Date.now(),
-              })
-            }
-            break
-
-          case 'done':
-            stopStreaming(convId)
-            break
-
-          case 'error':
-            stopStreaming(convId)
-            appendMsg(convId, {
-              id: crypto.randomUUID(), role: 'error',
-              content: data.content as string, timestamp: Date.now(),
-            })
-            break
+    switch (data.type) {
+      case 'connected':
+        setServerInfo({ model: data.model as string, hasApiKey: data.hasApiKey as boolean })
+        break
+      case 'pong':
+        break
+      case 'session_start':
+        if (convId) setLoading(convId, true)
+        break
+      case 'delta':
+        if (convId) patchDelta(convId, data.content as string)
+        break
+      case 'thinking_delta':
+        if (convId) patchThinking(convId, data.content as string)
+        break
+      case 'assistant_text':
+        if (convId) appendMsg(convId, { id: uid(), role: 'assistant', content: data.content as string, timestamp: Date.now() })
+        break
+      case 'thinking':
+        if (convId) appendMsg(convId, { id: uid(), role: 'thinking', content: data.content as string, timestamp: Date.now() })
+        break
+      case 'tool_call':
+        if (convId) appendMsg(convId, {
+          id: uid(), role: 'tool_call', content: JSON.stringify(data.input, null, 2),
+          toolName: data.toolName as string, toolId: data.toolId as string, toolInput: data.input,
+          timestamp: Date.now(),
+        })
+        break
+      case 'tool_result':
+        if (convId) appendMsg(convId, {
+          id: uid(), role: 'tool_result', content: data.content as string,
+          toolId: data.toolId as string, toolName: data.toolName as string,
+          isError: data.isError as boolean, timestamp: Date.now(),
+        })
+        break
+      case 'stderr':
+        if (convId) appendMsg(convId, { id: uid(), role: 'stderr', content: data.content as string, timestamp: Date.now() })
+        break
+      case 'result':
+      case 'done':
+      case 'session_end':
+        if (convId) stopAllStreaming(convId)
+        break
+      case 'interrupted':
+        if (convId) stopAllStreaming(convId)
+        break
+      case 'error':
+        if (convId) {
+          stopAllStreaming(convId)
+          appendMsg(convId, { id: uid(), role: 'error', content: data.content as string, timestamp: Date.now() })
         }
-      } catch {}
+        break
     }
-  }, [mapConvId, appendMsg, patchStream, patchThinking, stopStreaming])
+  }, [appendMsg, patchDelta, patchThinking, setLoading, stopAllStreaming, setServerInfo])
+
+  const handleMessageRef = useRef(handleMessage)
+  handleMessageRef.current = handleMessage
 
   useEffect(() => {
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let socket: WebSocket | null = null
+
+    const connect = () => {
+      if (disposed) return
+      if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+      socket = new WebSocket(`${proto}://${location.host}/ws`)
+      wsRef.current = socket
+      setStatus('connecting')
+
+      socket.onopen = () => { if (!disposed) setStatus('connected') }
+      socket.onclose = () => {
+        if (disposed) return
+        setStatus('disconnected')
+        timer = setTimeout(connect, 2000)
+      }
+      socket.onerror = () => { /* onclose will fire */ }
+      socket.onmessage = (e) => handleMessageRef.current(e)
+    }
+
     connect()
+
+    const ping = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'ping' }))
+      }
+    }, 20_000)
+
     return () => {
-      reconnectTimer.current && clearTimeout(reconnectTimer.current)
-      ws.current?.close()
+      disposed = true
+      clearInterval(ping)
+      timer && clearTimeout(timer)
+      if (socket) {
+        socket.onclose = null
+        socket.onmessage = null
+        socket.onerror = null
+        socket.close()
+      }
     }
   }, [])
 
   const sendMessage = useCallback((text: string) => {
-    let convId = activeId
-    if (!convId) {
-      convId = newConversation()
-    }
-    pendingConvId.current = convId
-
-    appendMsg(convId, { id: crypto.randomUUID(), role: 'user', content: text, timestamp: Date.now() })
-
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ type: 'message', content: text, conversationId: convId }))
+    let convId = activeRef.current
+    if (!convId) convId = newConversation()
+    appendMsg(convId, { id: uid(), role: 'user', content: text, timestamp: Date.now() })
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      setLoading(convId, true)
+      wsRef.current.send(JSON.stringify({ type: 'message', content: text, conversationId: convId }))
     } else {
-      appendMsg(convId, { id: crypto.randomUUID(), role: 'error', content: 'Not connected to server.', timestamp: Date.now() })
+      appendMsg(convId, { id: uid(), role: 'error', content: 'Not connected. Try again in a moment.', timestamp: Date.now() })
     }
-  }, [activeId, newConversation, appendMsg])
+  }, [newConversation, appendMsg, setLoading])
 
-  return { status, conversations, activeId, setActiveId, getActive, newConversation, sendMessage }
+  const interrupt = useCallback((convId: string) => {
+    wsRef.current?.readyState === WebSocket.OPEN &&
+      wsRef.current.send(JSON.stringify({ type: 'interrupt', conversationId: convId }))
+  }, [])
+
+  return { status, serverInfo, conversations, activeId, setActiveId, getActive, newConversation, sendMessage, interrupt }
 }

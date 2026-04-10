@@ -308,6 +308,7 @@ async function runAgentLoop(session: Session, ws: WebSocket): Promise<void> {
       const requestMessages = session.messages as OpenAI.Chat.ChatCompletionMessageParam[]
 
       // ── API call with streaming ──────────────────────────────────────────
+      log('agent', session.id, `calling API (${session.messages.length} messages)`)
       let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>
       try {
         stream = await client.chat.completions.create(
@@ -324,6 +325,7 @@ async function runAgentLoop(session: Session, ws: WebSocket): Promise<void> {
         )
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
+        log('agent', session.id, `API error: ${msg}`)
         if (msg.includes('aborted')) {
           send(ws, { type: 'interrupted', conversationId: session.id })
         } else {
@@ -627,11 +629,6 @@ function createWebSocketServer(httpServer: http.Server, registry: SessionRegistr
     ws.on('close', (code) => {
       log('ws', '-', `disconnected (${code})`)
       clients.delete(ws)
-      // Abort all running sessions for this client
-      for (const sess of registry.allForClient(ws)) {
-        if (sess.running) sess.abort?.abort()
-        registry.remove(sess.id)
-      }
     })
 
     ws.on('error', (err) => log('ws', '-', `error: ${err.message}`))
