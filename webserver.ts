@@ -307,32 +307,50 @@ async function runAgentLoop(session: Session, ws: WebSocket): Promise<void> {
     while (session.running) {
       const requestMessages = session.messages as OpenAI.Chat.ChatCompletionMessageParam[]
 
-      // ── API call with streaming ──────────────────────────────────────────
+      // ── API call with streaming (retry on 429) ────────────────────────
       log('agent', session.id, `calling API (${session.messages.length} messages)`)
       let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>
-      try {
-        stream = await client.chat.completions.create(
-          {
-            model: CONFIG.model,
-            messages: requestMessages,
-            tools: TOOLS,
-            tool_choice: 'auto',
-            stream: true,
-            // @ts-expect-error — OpenRouter reasoning extension
-            reasoning: { enabled: true },
-          },
-          { signal: session.abort.signal },
-        )
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err)
-        log('agent', session.id, `API error: ${msg}`)
-        if (msg.includes('aborted')) {
-          send(ws, { type: 'interrupted', conversationId: session.id })
-        } else {
+      const MAX_RETRIES = 5
+      let lastErr: unknown = null
+      let gotStream = false
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          stream = await client.chat.completions.create(
+            {
+              model: CONFIG.model,
+              messages: requestMessages,
+              tools: TOOLS,
+              tool_choice: 'auto',
+              stream: true,
+              // @ts-expect-error — OpenRouter reasoning extension
+              reasoning: { enabled: true },
+            },
+            { signal: session.abort.signal },
+          )
+          gotStream = true
+          break
+        } catch (err: unknown) {
+          lastErr = err
+          const msg = err instanceof Error ? err.message : String(err)
+          const status = (err as { status?: number }).status
+          if (msg.includes('aborted')) {
+            log('agent', session.id, `aborted`)
+            send(ws, { type: 'interrupted', conversationId: session.id })
+            break
+          }
+          if (status === 429 && attempt < MAX_RETRIES - 1) {
+            const delay = Math.min(2000 * Math.pow(2, attempt), 30000)
+            log('agent', session.id, `rate limited (429), retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms`)
+            send(ws, { type: 'delta', conversationId: session.id, content: attempt === 0 ? `⏳ Rate limited — retrying (${attempt + 1}/${MAX_RETRIES})...` : ` retry ${attempt + 1}...` })
+            await new Promise(r => setTimeout(r, delay))
+            continue
+          }
+          log('agent', session.id, `API error: ${msg}`)
           send(ws, { type: 'error', conversationId: session.id, content: `API error: ${msg}` })
+          break
         }
-        break
       }
+      if (!gotStream) break
 
       // ── Accumulate streaming response ────────────────────────────────────
       let assistantText = ''
